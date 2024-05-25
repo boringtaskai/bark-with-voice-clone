@@ -24,18 +24,19 @@ from utils.lora import convert_linear_layer_to_lora, only_optimize_lora_paramete
 from bark.model import GPTConfig, GPT
 from bark.model_fine import FineGPT, FineGPTConfig
 
+# Training Parameter
 train_batch_size = 8
 eval_batch_size = 8
 grad_accum = 2
-ckpt_path = 'models/text_2.pt'
-model_type = "text"
+ckpt_path = 'models/fine_2.pt'
+model_type = "fine"
 dataset_path = 'datasets/id/'
 logging_dir = 'logs/'
 log_with = 'wandb'
 hubert_path = 'data/models/hubert/hubert.pt'
 hubert_tokenizer_path = 'data/models/hubert/tokenizer.pth'
 
-output_dir = 'semantic_output/'
+output_dir = 'fine_output/'
 resume_from_checkpoint = None
 
 checkpointing_steps = 1000
@@ -71,9 +72,10 @@ max_grad_norm = 1.0
 
 seed = 741
 
+# Define Function
 CONTEXT_WINDOW_SIZE = 1024
 
-MAX_TEXT_LEN = 256
+MAX_SEMANTIC_LEN = 256
 
 SEMANTIC_RATE_HZ = 49.9
 SEMANTIC_VOCAB_SIZE = 10_000
@@ -83,22 +85,33 @@ SEMANTIC_PAD_TOKEN = 10_000
 TEXT_PAD_TOKEN = 129_595
 SEMANTIC_INFER_TOKEN = 129_599
 
-MAX_SEMANTIC_LEN = 511
+MAX_COARSE_LEN = 768
 
 SAMPLE_RATE = 24_000
 CHANNELS = 1
 
+COARSE_SEMANTIC_PAD_TOKEN = 12_048
+COARSE_INFER_TOKEN = 12_050
+
+CODEBOOK_SIZE = 1024
+N_COARSE_CODEBOOKS = 2
+N_FINE_CODEBOOKS = 8
+COARSE_RATE_HZ = 75
+
 logger = logging.getLogger(__name__)
+
 
 USE_SMALL_MODELS = os.environ.get("SERP_USE_SMALL_MODELS", False)
 
 default_cache_dir = os.path.join(os.path.expanduser("~"), ".cache")
 CACHE_DIR = os.path.join(os.getenv("XDG_CACHE_HOME", default_cache_dir), "serp", "bark_v0")
 
+
 def _clear_cuda_cache():
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
         torch.cuda.synchronize()
+
 
 def _md5(fname):
     hash_md5 = hashlib.md5()
@@ -107,6 +120,7 @@ def _md5(fname):
             hash_md5.update(chunk)
     return hash_md5.hexdigest()
 
+
 def _download(from_hf_path, file_name, to_local_path):
     to_local_path = to_local_path.replace("\\", "/")
     path = '/'.join(to_local_path.split("/")[:-1])
@@ -114,8 +128,10 @@ def _download(from_hf_path, file_name, to_local_path):
     hf_hub_download(repo_id=from_hf_path, filename=file_name, local_dir=path)
     os.replace(os.path.join(path, file_name), to_local_path)
 
+
 def _tokenize(tokenizer, text):
     return tokenizer.encode(text, add_special_tokens=False)
+
 
 def _detokenize(tokenizer, enc_text):
     return tokenizer.decode(enc_text)
@@ -123,6 +139,7 @@ def _detokenize(tokenizer, enc_text):
 
 def _normalize_whitespace(text):
     return re.sub(r"\s+", " ", text).strip()
+
 
 REMOTE_MODEL_PATHS = {
     "text_small": {
@@ -156,6 +173,7 @@ REMOTE_MODEL_PATHS = {
         "checksum": "59d184ed44e3650774a2f0503a48a97b",
     },
 }
+
 
 def _load_model(ckpt_path, device, use_small=False, model_type="text"):
     if model_type == "text":
@@ -210,6 +228,17 @@ def _load_model(ckpt_path, device, use_small=False, model_type="text"):
         return model, tokenizer
     return model
 
+
+def _flatten_codebooks(arr, offset_size=CODEBOOK_SIZE):
+    assert len(arr.shape) == 2
+    arr = arr.copy()
+    if offset_size is not None:
+        for n in range(1, arr.shape[0]):
+            arr[n, :] += offset_size * n
+    flat_arr = arr.ravel("F")
+    return flat_arr
+
+
 def load_filepaths_and_text(filename, split="|"):
     with open(filename, encoding='utf-8', errors='ignore') as f:
         filepaths_and_text = [line.strip().split(split) for line in f]
@@ -218,64 +247,62 @@ def load_filepaths_and_text(filename, split="|"):
             filepaths_and_text[j][0] = os.path.join(base, filepaths_and_text[j][0])
     return filepaths_and_text
 
+
 class TtsDataset(torch.utils.data.Dataset):
     def __init__(self, opt):
         self.path = os.path.dirname(opt['path'])
         self.mode = opt['mode']
-        self.audiopaths_and_text = load_filepaths_and_text(os.path.join(opt['path'] , opt['mode'] + '_valid.txt'))
-        self.tokenizer = opt['tokenizer']
+        self.audiopaths_and_text = load_filepaths_and_text(os.path.join(opt['path'] , opt['mode'] + '.txt'))
 
     def __getitem__(self, index):
         audiopath_and_text = self.audiopaths_and_text[index]
-        audiopath, text = audiopath_and_text[0], audiopath_and_text[1]
+        audiopath = audiopath_and_text[0]
 
-        input_ids = np.array(_tokenize(self.tokenizer, text)) + TEXT_ENCODING_OFFSET
-        input_ids = torch.from_numpy(input_ids).long()
         tokens = np.load(audiopath.replace('.mp3', '.npz').replace('wav', 'tokens'))
-        semantic_tokens = tokens['semantic']
-        semantic_tokens = torch.from_numpy(semantic_tokens).long()
+        fine_tokens = tokens['fine']
 
-        return input_ids, semantic_tokens
+        return torch.from_numpy(fine_tokens)
 
     def __len__(self):
         return len(self.audiopaths_and_text)
+
 
 class TtsCollater():
     def __init__(self):
         pass
     def __call__(self, batch):
-        max_text_len = MAX_TEXT_LEN
-        max_semantic_tokens_len = MAX_SEMANTIC_LEN
-        texts = []
-        semantic_tokens = []
+        max_len = 1024
+        fine_tokens = []
 
-        for b in batch:
-            text, semantic_tokens_ = b
-            text = F.pad(text, (0, max_text_len-len(text)), value=TEXT_PAD_TOKEN)
-            semantic_history = torch.from_numpy(np.array([SEMANTIC_PAD_TOKEN] * 256))
-            text = torch.cat([text, semantic_history, torch.tensor([SEMANTIC_INFER_TOKEN])])
-            texts.append(text)
-            semantic_tokens_ = semantic_tokens_[:max_semantic_tokens_len]
-            semantic_tokens.append(F.pad(semantic_tokens_, (0, max_semantic_tokens_len-len(semantic_tokens_)), value=SEMANTIC_PAD_TOKEN))
+        for fine_tokens_ in batch:
+            if fine_tokens_.shape[1] > max_len:
+                start_idx = np.random.randint(0, fine_tokens_.shape[1] - max_len + 1)
+                fine_tokens_ = fine_tokens_[:, start_idx : start_idx + max_len]
 
-        return {
-            'input_ids': torch.stack(texts).contiguous(),
-            'semantic_tokens': torch.stack(semantic_tokens).contiguous()
-        }
+            pad_size = max_len - fine_tokens_.shape[1]
+            fine_tokens_ = F.pad(fine_tokens_, (0, pad_size), value=CODEBOOK_SIZE)
+
+            fine_tokens_ = fine_tokens_.T
+
+            fine_tokens.append(fine_tokens_)
+
+        return {'fine_tokens': torch.stack(fine_tokens).contiguous()}
     
+
 accelerator = Accelerator(
     gradient_accumulation_steps=grad_accum,
     mixed_precision=mixed_precision,
     log_with=log_with,
     project_dir=logging_dir,
 )
-
 device = accelerator.device
-print("Device detected: ", device)
 
 os.makedirs(output_dir, exist_ok=True)
 
-model, tokenizer = _load_model(ckpt_path, device, use_small=False, model_type=model_type)
+set_seed(seed)
+
+# Setup
+model = _load_model(ckpt_path, device, use_small=False, model_type=model_type)
 
 if scale_lr:
     learning_rate = (
@@ -294,6 +321,7 @@ if use_8bit_adam:
 else:
     optimizer_class = torch.optim.AdamW
 
+
 quantization_config=BitsAndBytesConfig(
     load_in_4bit=bits == 4,
     load_in_8bit=bits == 8,
@@ -303,46 +331,6 @@ quantization_config=BitsAndBytesConfig(
     bnb_4bit_use_double_quant=double_quant,
     bnb_4bit_quant_type=quant_type # {'fp4', 'nf4'}
 )
-
-# if quantization_config.load_in_8bit or quantization_config.load_in_4bit:
-#     if quantization_config.load_in_8bit:
-#         logger.info("Detected 8-bit loading: activating 8-bit loading for this model")
-#     elif quantization_config.load_in_4bit:
-#         logger.info("Detected 4-bit loading: activating 4-bit loading for this model")
-
-#     # We keep some modules such as the lm_head in their original dtype for numerical stability reasons
-#     if llm_int8_skip_modules is None or len(llm_int8_skip_modules) == 0:
-#         modules_to_not_convert = [] # get_keys_to_not_convert(model)
-#     else:
-#         modules_to_not_convert = llm_int8_skip_modules
-
-#     if not isinstance(modules_to_not_convert, list):
-#         modules_to_not_convert = [modules_to_not_convert]
-
-#     modules_to_not_convert.extend(keep_in_fp32_modules)
-
-#     supports_4bit = version.parse(importlib_metadata.version("bitsandbytes")) >= version.parse("0.39.0")
-
-#     if quantization_config.load_in_4bit and not supports_4bit:
-#         raise ValueError(
-#             "You have a version of `bitsandbytes` that is not compatible with 4bit inference and training"
-#             " make sure you have the latest version of `bitsandbytes` installed"
-#         )
-    
-#     if len(modules_to_not_convert) == 0:
-#         modules_to_not_convert = None
-
-#     model = replace_with_bnb_linear(
-#         model, modules_to_not_convert=modules_to_not_convert, quantization_config=quantization_config
-#     )
-
-#     # training in 8-bit is only available in 0.37.0+
-#     model._is_kbit_training_enabled = version.parse(
-#         importlib_metadata.version("bitsandbytes")
-#     ) >= version.parse("0.37.0")
-
-#     model.config.quantization_config = quantization_config
-    
 
 if bits == 4:
     from accelerate.utils import CustomDtype
@@ -360,14 +348,15 @@ if lora_dim > 0:
         def forward(self, x):
             return super().forward(x).to(torch.float32)
 
-    model.lm_head = CastOutputToFloat(model.lm_head)
+    # model.lm_head = CastOutputToFloat(model.lm_head)
+    for i, lm_head in enumerate(model.lm_heads):
+        model.lm_heads[i] = CastOutputToFloat(lm_head)
 
     model = convert_linear_layer_to_lora(model, lora_module_name,
                                             lora_dim=lora_dim, lora_scaling=lora_scaling,
                                             lora_dropout=lora_dropout)
     if optimize_lora_params_only:
         model = only_optimize_lora_parameters(model)
-
 
 params_to_optimize = (
         param for param in model.parameters() if param.requires_grad
@@ -383,13 +372,11 @@ optimizer = optimizer_class(
 
 opt_train = {
     'path': dataset_path,
-    'tokenizer': tokenizer,
     'mode': 'train',
 }
 
 opt_val = {
     'path': dataset_path,
-    'tokenizer': tokenizer,
     'mode': 'valid',
 }
 
@@ -408,7 +395,7 @@ validation_dataloader = torch.utils.data.DataLoader(
     collate_fn=TtsCollater(),
 )
 
-criterion = torch.nn.CrossEntropyLoss() #ignore_index=SEMANTIC_PAD_TOKEN)
+criterion = torch.nn.CrossEntropyLoss(ignore_index=COARSE_SEMANTIC_PAD_TOKEN)
 
 # Scheduler and math around the number of training steps.
 overrode_max_train_steps = False
@@ -445,9 +432,8 @@ num_train_epochs = math.ceil(max_train_steps / num_update_steps_per_epoch)
 # We need to initialize the trackers we use, and also store our configuration.
 # The trackers initializes automatically on the main process.
 if accelerator.is_main_process:
-    accelerator.init_trackers("bark_semantic", config={})
+    accelerator.init_trackers("bark_coarse", config={})
 
-# Train!
 total_batch_size = train_batch_size * accelerator.num_processes * grad_accum
 logger.info("***** Running training *****")
 logger.info(f"  Num examples = {len(train_dataset)}")
@@ -477,7 +463,6 @@ if resume_from_checkpoint:
     first_epoch = resume_global_step // num_update_steps_per_epoch
     resume_step = resume_global_step % num_update_steps_per_epoch
 
-
 if accelerator.is_main_process:
     model.eval()
     validation_loss = 0.0
@@ -486,19 +471,23 @@ if accelerator.is_main_process:
     with torch.no_grad():
         for val_step, val_batch in enumerate(validation_dataloader):
             # Similar to training, process the validation batch
-            val_targets = val_batch['semantic_tokens'][:, 1:].contiguous()
-            val_semantic_inputs = val_batch['semantic_tokens'][:, :-1]
-            val_inputs = torch.cat([val_batch['input_ids'], val_semantic_inputs], dim=1)
+            fine_targets_7 = val_batch['fine_tokens'][:, :, 6]
+            fine_tokens_input_7 = torch.cat([val_batch['fine_tokens'][:, :, :6], torch.zeros_like(val_batch['fine_tokens'][:, :, 6:])], dim=2)
+            fine_targets_8 = val_batch['fine_tokens'][:, :, 7]
+            fine_tokens_input_8 = torch.cat([val_batch['fine_tokens'][:, :, :7], torch.zeros_like(val_batch['fine_tokens'][:, :, 7:])], dim=2)
 
             # Forward pass for validation
-            val_logits = model(val_inputs, training=True)
-            val_semantic_logits = val_logits[:, val_batch['input_ids'].size(1):].contiguous()
+            logits_7 = model(6, fine_tokens_input_7)
+            logits_8 = model(7, fine_tokens_input_8)
 
             # Calculate the validation loss
-            val_loss = criterion(val_semantic_logits.view(-1, model.module.config.output_vocab_size), val_targets.view(-1))
-            validation_loss += val_loss.item()
+            loss_7 = criterion(logits_7.view(-1, model.config.output_vocab_size), fine_targets_7.view(-1))
+            loss_8 = criterion(logits_8.view(-1, model.config.output_vocab_size), fine_targets_8.view(-1))
+
+            loss = (loss_7 + loss_8) / 2
+            validation_loss += loss.item()
             num_batches += 1
-            num_samples += val_batch['input_ids'].size(0)
+            num_samples += val_batch['fine_tokens'].size(0)
 
     average_validation_loss = validation_loss / num_batches
     logger.info(f"Validation Loss: {average_validation_loss} over {num_samples} samples and {num_batches} batches.")
@@ -518,20 +507,20 @@ for epoch in range(first_epoch, num_train_epochs):
             continue
 
         with accelerator.accumulate(model):
-            targets = batch['semantic_tokens'][:, 1:].contiguous()
-    
-            # Remove the last semantic token from the inputs since there is no target for it.
-            semantic_inputs = batch['semantic_tokens'][:, :-1]
+            fine_targets_7 = batch['fine_tokens'][:, :, 6]
+            fine_tokens_input_7 = torch.cat([batch['fine_tokens'][:, :, :6], torch.zeros_like(batch['fine_tokens'][:, :, 6:])], dim=2)
+            fine_targets_8 = batch['fine_tokens'][:, :, 7]
+            fine_tokens_input_8 = torch.cat([batch['fine_tokens'][:, :, :7], torch.zeros_like(batch['fine_tokens'][:, :, 7:])], dim=2)
 
-            # Combine the text and semantic tokens and feed them into the model.
-            inputs = torch.cat([batch['input_ids'], semantic_inputs], dim=1)
-            logits = model(inputs, training=True)
+            # Forward pass
+            logits_7 = model(6, fine_tokens_input_7)
+            logits_8 = model(7, fine_tokens_input_8)
 
-            # We're only interested in the logits for the semantic tokens, so we ignore the logits for the input text tokens.
-            semantic_logits = logits[:, batch['input_ids'].size(1):].contiguous()
+            # Calculate the loss
+            loss_7 = criterion(logits_7.view(-1, model.config.output_vocab_size), fine_targets_7.view(-1))
+            loss_8 = criterion(logits_8.view(-1, model.config.output_vocab_size), fine_targets_8.view(-1))
 
-            # Compute the loss.
-            loss = criterion(semantic_logits.view(-1, model.module.config.output_vocab_size), targets.view(-1))
+            loss = (loss_7 + loss_8) / 2
 
             accelerator.backward(loss)
             if accelerator.sync_gradients:
@@ -568,10 +557,40 @@ if accelerator.is_main_process:
         model = convert_lora_to_linear_layer(model)
     # save model
     accelerator.save(model.state_dict(), os.path.join(output_dir, "pytorch_model.bin"))
-
-    config = model.module.config.__dict__
+    
+    config = model.config.__dict__
     # save config
     with open(os.path.join(output_dir, "config.json"), "w") as f:
         json.dump(config, f, indent=2)
 
 accelerator.end_training()
+
+if accelerator.is_main_process:
+    model.eval()
+    validation_loss = 0.0
+    num_batches = 0
+    num_samples = 0
+    with torch.no_grad():
+        for val_step, val_batch in enumerate(validation_dataloader):
+            # Similar to training, process the validation batch
+            fine_targets_7 = val_batch['fine_tokens'][:, :, 6]
+            fine_tokens_input_7 = torch.cat([val_batch['fine_tokens'][:, :, :6], torch.zeros_like(val_batch['fine_tokens'][:, :, 6:])], dim=2)
+            fine_targets_8 = val_batch['fine_tokens'][:, :, 7]
+            fine_tokens_input_8 = torch.cat([val_batch['fine_tokens'][:, :, :7], torch.zeros_like(val_batch['fine_tokens'][:, :, 7:])], dim=2)
+
+            # Forward pass for validation
+            logits_7 = model(6, fine_tokens_input_7)
+            logits_8 = model(7, fine_tokens_input_8)
+
+            # Calculate the validation loss
+            loss_7 = criterion(logits_7.view(-1, model.config.output_vocab_size), fine_targets_7.view(-1))
+            loss_8 = criterion(logits_8.view(-1, model.config.output_vocab_size), fine_targets_8.view(-1))
+
+            loss = (loss_7 + loss_8) / 2
+            validation_loss += loss.item()
+            num_batches += 1
+            num_samples += val_batch['fine_tokens'].size(0)
+
+    average_validation_loss = validation_loss / num_batches
+    logger.info(f"Validation Loss: {average_validation_loss} over {num_samples} samples and {num_batches} batches.")
+    print(f"Validation Loss: {average_validation_loss} over {num_samples} samples and {num_batches} batches.")
